@@ -1,0 +1,354 @@
+// *****************************************************************************************
+// -----------------------------------------------------------------------------------------
+//  C L A S S I F Y - D O S S I E R - D O C U M E N T S  
+// -----------------------------------------------------------------------------------------
+// *****************************************************************************************
+// Version:     1.0
+// Date:        20160425 
+
+// Classify-HR-Docs performs the following actions
+// 	- load files from the input location and retrieve the base text content 
+//	- classify the documents against given keywords and through a classifier 
+//	it results is a suggested document classification type based on the model
+
+//	Based on the number of documents to classify the process can be time consuming
+
+//	PARAMETERS
+//		Input:		
+//		Input:		
+
+use Collection, File, Stream, String, System;
+    include globals.variables.generic_variables;
+    include globals.routines.global_routines_generic;
+    include globals.routines.global_routines_mcc;
+    include globals.routines.global_classifier;
+
+// ****************************************************************************************************
+// ** V A R I A B L E - D E C L A R A T I O N - B L O C K 
+// ****************************************************************************************************
+
+//var cust_name                = "DeBetuwe";
+var cust_name                = "sonepar";
+// var cust_name                   = "Karmac";
+
+var cust_settings_bot           = String.join(["Globals/Classifier/Classifier_Settings_", cust_name ,".xill"]);
+var settings                    = callbot("Globals/Settings/Global_Settings.xill", {"server":"localhost" , "dbsname":cust_name});
+var dlc                         = callbot(cust_settings_bot);
+var Bestand_Txt                 = "";
+var Bestand_Txt_Stripped        = "";
+var Bestanden                   = {};
+var Class_List                  = "";
+var Class_result                = {};
+var Classification_Stats        = {};
+var content_check               = {};
+var doc_id_found                = false;
+var doc_ids                     = {};           // used to create a list of the unique document identifiers for recognition
+var doc_list                    = {};
+var doc_is_mail                 = false;
+var DossierSeq                  = 0;
+var dossier_tab                 = "";
+var email_check                 = "";
+var final_classification_result = "";
+var folder_items                = {};
+var Folders                     = File.iterateFolders(settings.path_import, true);
+var header_lines                = {};
+var header_string               = "Source Filename;Target Filename;Dossier tab;Final result;Classification tag;Percentage;Relevance;Characters;Keyword;Probability\n";
+var invalidCharsHex             = "";
+var logfile                     = File.openWrite(String.join([settings.path_audittrail, "classification.log"]));
+var max_text_length             = 1200;
+var Number_of_Docs              = 0;
+var Number_of_Docs_UnD          = 0;
+var Number_of_Folders           = 0;
+var possible_docs               = {};
+var last_folder_name            = "";
+var results_file                = File.openWrite(settings.results_file);
+var savelog                     = settings.savelogfile;
+var set_final_result            = false;
+var tags                        = {};
+var template_id_match           = false;
+var term_list                   = {};
+var terms                       = {};
+
+// ======================================================================================================
+// ******************   M A I N - C O D E  **************************************************************
+// ======================================================================================================
+
+    writeAuditTrail (logfile, "Starting classification module", 0, savelog);
+    Stream.write    (header_string, results_file);
+
+
+    // initializing the classificaton runtime statistics, will count each document classified
+    foreach(waarde, value in dlc.HR_dossier_tabs) {
+        foreach(_, doctype in value) {
+            Classification_Stats[String.join([waarde , "-" , doctype])] = 0;
+        }
+        Classification_Stats[String.join([waarde , "-undefined"])] = 0;
+    }
+    
+    // initialize the document counter for each document type in a dossie
+    // used to generate a sequence number in writing files after classsification
+    foreach(value, item in dlc.HR_external_name) {
+        doc_list[item] = 1;
+    }
+    
+    // loading all the document recognition terms from the configuration file
+    foreach (waarde, value in dlc.document_types) {
+        if (value.active && Collection.length(value.keyterms) != 0) {
+            if (value.doc_id != null ) {
+                    doc_ids[waarde]     = value.doc_id;
+            }
+            if (value.header_line != null ) {
+                    header_lines[waarde]    = value.header_line;
+            }
+            terms[waarde]       = value.keyterms;
+        }
+    }
+    
+    // creating the output folder if it doesn't exist already
+    File.createFolder(settings.path_files);
+    
+    // reading all sub folders and processing each file in the folder for classification
+    foreach(i, Folder in Folders) {
+        if (dlc.allfolders || String.contains(Folder, dlc.specific_folder)) {
+            Bestanden = File.iterateFiles(Folder.path, true);
+            
+            foreach(j, Bestand in Bestanden) {
+                writeAuditTrail     (logfile, String.join(["Processing file " , Bestand]), 0, savelog);
+                folder_items        = String.split(Bestand, "\\\\", false);
+                last_folder_name    = folder_items[Collection.length(folder_items)-2];
+                
+                // Check if dossiertab is incorporated in filename.
+                dossier_tab         = get_dossier_tab(folder_items[Collection.length(folder_items)-1], dlc);
+                possible_docs       = dlc.HR_dossier_tabs[dossier_tab];
+                // possible_docs       = dlc.HR_dossier_tabs[last_folder_name];
+                content_check       = {};
+                term_list           = {};
+                set_final_result    = false;
+                doc_id_found        = false;
+                
+                var file_type       = getcontenttype(Bestand);
+                Bestand_Txt         = gettext(Bestand, file_type);
+                Class_result        = {};
+                var class_text_length     = max_text_length;
+                
+                if ( Bestand_Txt == "" || Bestand_Txt == null ) {
+                    writeAuditTrail(logfile, "   ERROR: empty text file", 3, savelog);
+                    continue;
+                } 
+                else
+                {   Bestand_Txt_Stripped    = String.replace(Bestand_Txt, "[\\x0A\\x0D]", " ");
+                    Bestand_Txt_Stripped    = String.replace(Bestand_Txt_Stripped, "[^\\x20\\x2F-\\x39\\x41-\\x5A\\x61-\\x7A]+","");
+                    // System.print(String.length(Bestand_Txt_Stripped));
+                    
+                    if (String.length(Bestand_Txt_Stripped) > 2000 ) { class_text_length = 1600; }
+                    if (String.length(Bestand_Txt_Stripped) > 3000 ) { class_text_length = 2100; }
+                    if (String.length(Bestand_Txt_Stripped) > 4000 ) { class_text_length = 2600; }
+                    if (String.length(Bestand_Txt_Stripped) < max_text_length ) 
+                            { class_text_length = dlc.length_header_txt; }
+                    
+                    if (String.length(Bestand_Txt_Stripped) + 1 > dlc.length_header_txt) {
+                        var text_length = dlc.length_header_txt;
+                        var all_text    = false;
+                        
+                        if (dlc.use_doc_ids) {
+                            // if this project is having document identifiers as option to recognize
+                            // its first tested against the document (header) text.
+                            content_check   = check_doc_id(String.substring(String.toLower(Bestand_Txt_Stripped),0, text_length), doc_ids, dlc, term_list);
+                            if (Collection.length(content_check) != 0) {
+                                    doc_id_found = true;
+                                    writeAuditTrail(logfile, "   Document classified by unique identifier!", 9, savelog);
+                            }
+                        }
+                        
+                        if (!doc_id_found && Collection.length(header_lines) > 0 ) {
+                            // check the document content per line on the presence of a specific header_line
+                            var Bestand_Lines = String.split(Bestand_Txt, "\n", false);
+                            foreach(Key, Line in Bestand_Lines ) {
+                                // check against header_lines
+                                if (String.length(Line) > 25) {
+                                    continue;
+                                }
+                                content_check = check_headers(String.toLower(Line), header_lines, dlc, term_list);
+                                if (Collection.length(content_check) > 0 ) {
+                                        writeAuditTrail(logfile, "   Document classfied by header line!", 9, savelog);
+                                        doc_id_found = true;
+                                        break;
+                                }
+                                if (Key > 10) {
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        while (!doc_id_found) {
+                            content_check = check_headers(String.substring(String.toLower(Bestand_Txt_Stripped),0, text_length), terms, dlc, term_list);
+                            writeAuditTrail(logfile, String.substring(String.toLower(Bestand_Txt_Stripped),0,text_length), 9, savelog);
+                            if ( Collection.length(content_check) == 0 ) {
+                                    text_length = text_length + 500;
+                                    if ( text_length > class_text_length )  // possible multiple text iterations
+                                            { break; }
+                                    if ( text_length > String.length(Bestand_Txt_Stripped) && all_text == false) 
+                                            { text_length = String.length(Bestand_Txt_Stripped);
+                                              all_text = true;}
+                                    else { continue; }
+                            }
+                            else
+                            {       break;
+                            }
+                        }
+                    } 
+                    else
+                    {
+                        if ( String.length(Bestand_Txt_Stripped) > 2 ) {
+                            content_check       = check_doc_id(String.toLower(Bestand_Txt_Stripped), doc_ids, dlc, term_list);
+                            if (Collection.length(content_check) == 0) {
+                                    content_check       = check_headers(String.toLower(Bestand_Txt_Stripped), terms, dlc, term_list);
+                            }
+                            writeAuditTrail(logfile, String.toLower(Bestand_Txt_Stripped), 9, savelog);
+                        }
+                    }
+                    
+                    // classify the document against the model
+                    if ( dlc.use_classifier ) {
+                            tags                    = classify(Bestand_Txt, settings.ClModel);
+                            Class_result["tags"]    = process_tags(tags, dlc);
+                    } 
+                    else
+                    {   // if classifier is not used - use a dummy value set
+                        tags    =   {   "documentsoort" : "undefined",
+                                        "score"         : 0,
+                                        "probability"   : 0
+                        };
+                        Class_result["tags"] = tags;
+                    }
+                }
+                
+                if (    Collection.length(term_list) == 1 && 
+                        Collection.contains(dlc.needs_classifier_list, term_list[0]) && 
+                        dlc.use_classifier == false) {
+                    // will run classifier as additional check.
+                    tags = xda_Classify("http://127.0.0.1:15555", Bestand_Txt_Stripped, 5);
+                    Class_result["tags"]    = process_tags(tags.proba, dlc);
+                    if (Class_result.tags.score < dlc.document_types[Class_result.tags.documentsoort].threshold) {
+                        content_check = {};  // reset values to UNDEFINED due to classifier score
+                    }
+                    foreach (values, new_doc_type in dlc.substitute_list) {
+                        if (Collection.contains(new_doc_type, term_list[0])) {
+                            content_check               = { values : 9 };
+                            final_classification_result = values;
+                            set_final_result            = true;
+                        }
+                    }
+                    
+                }
+                
+                // determine the final result based on the classification and the keyword check
+                if ( !set_final_result ) {
+                        final_classification_result = process_results(Bestand, Class_result, content_check, 
+                                                              String.length(Bestand_Txt), dlc,
+                                                              possible_docs, content_check,
+                                                              dossier_tab);
+                }
+                
+                if (final_classification_result == "identiteitsbewijs" && 
+                        ( Collection.contains(term_list, "paspoort") || Collection.contains(term_list, "rijbewijs"))) {
+                    if ( String.length(Bestand_Txt) > 1500 ) {
+                        // An identification document doesn't contain a lot of text. If the document
+                        // does and is found only on paspoort or rijbewijs, it probably is an other type of document.
+                        final_classification_result = "undefined";
+                    }
+                }
+                
+                if (final_classification_result == "undefined" && String.length(Bestand_Txt) > 200 ) {
+                        if (String.length(Bestand_Txt_Stripped) > 300) {
+                            final_classification_result = check_for_email(String.substring(String.toLower(Bestand_Txt_Stripped),0, 300));
+                        } else {
+                            final_classification_result = check_for_email(String.substring(String.toLower(Bestand_Txt_Stripped),0, String.length(Bestand_Txt_Stripped)));
+                        }
+                } else {
+                        if (String.length(Bestand_Txt_Stripped) > 300 ) {
+                                email_check = check_for_email(String.substring(String.toLower(Bestand_Txt_Stripped), 0, 299));
+                        } else {
+                                email_check = check_for_email(String.substring(String.toLower(Bestand_Txt_Stripped),0, String.length(Bestand_Txt_Stripped)));
+                        }
+                        if (email_check == "correspondentie") 
+                                    { doc_is_mail = true; } else { doc_is_mail = false; } 
+                }
+                
+                // determine the dossier tab which corresponds to the document classification result
+                dossier_tab = "";
+                
+                foreach(docvalue in possible_docs) {
+                    if (String.contains(docvalue, final_classification_result)) {
+                        dossier_tab = last_folder_name;
+                        break;
+                    } else {
+                        dossier_tab = last_folder_name;
+                    }
+                }
+                
+                var result = rename_document(Bestand, final_classification_result, DossierSeq, dlc, settings, doc_list, String.length(Bestand_Txt), doc_is_mail );
+                
+                var filename_parts = String.split(result, "/");
+                DossierSeq = filename_parts[Collection.length(filename_parts)-2];
+                
+                Class_List  = String.join([Bestand, result, dossier_tab, final_classification_result], ";");
+                Class_List  = String.join([Class_List, Class_result.tags.documentsoort, Class_result.tags.score, 
+                                            Class_result.tags.probability], ";");
+                Class_List  = String.join([Class_List, String.length(Bestand_Txt)], ";");
+                foreach(doc_type, resultaat in content_check) {
+                    Class_List = String.join([Class_List, doc_type, resultaat], ";");
+                }
+                Class_List = String.join([Class_List, "\n"]);
+                Stream.write(Class_List, results_file );
+                
+                if ( Classification_Stats[String.join([dossier_tab , "-" , final_classification_result])] == null || 
+                     Classification_Stats[String.join([dossier_tab , "-" , final_classification_result])] == "") 
+                    {
+                        if ( Classification_Stats[String.join(["AndereTab-" , final_classification_result])] == null || 
+                             Classification_Stats[String.join(["AndereTab-" , final_classification_result])] == "") {
+                                    Classification_Stats[String.join(["AndereTab-" , final_classification_result])] = 1;
+                        } 
+                        else
+                        {
+                                    Classification_Stats[String.join(["AndereTab-" , final_classification_result])] = 
+                                        Classification_Stats[String.join(["AndereTab-" , final_classification_result])] + 1; 
+                        }
+                    }
+                    else 
+                    {
+                            Classification_Stats[String.join([dossier_tab , "-" , final_classification_result])] =
+                               Classification_Stats[String.join([dossier_tab + "-" , final_classification_result])] + 1;
+                    }
+
+                // set as possible break point for controlling the classification result
+                if (final_classification_result == "undefined") {
+                    // set break point at this line - for tracing purposes only
+                }
+                
+                writeAuditTrail(logfile, String.join(["  ==> " , final_classification_result]), 9, savelog );
+                writeAuditTrail(logfile, String.join(["Classificatie resultaten:" , Class_List]), 8, savelog);
+                Number_of_Docs = Number_of_Docs + 1;
+                if (final_classification_result == "undefined") 
+                        { Number_of_Docs_UnD = Number_of_Docs_UnD + 1; }
+
+            }
+        }
+    }
+
+    
+// ****************************************************************************************************
+// ** E N D - O F - P R O C E S S 
+// ****************************************************************************************************
+
+    writeAuditTrail(logfile, "End of classification process.", 0, savelog);
+    writeAuditTrail(logfile, "   ------------------------------------------", 0, savelog);
+    writeAuditTrail(logfile, String.join(["   Number of folders processed    ; " , Number_of_Folders]), 0, savelog);
+    writeAuditTrail(logfile, String.join(["   Number of documents processed  ; " , Number_of_Docs]), 0 , savelog);
+    writeAuditTrail(logfile, String.join(["   Number of documents classified ; " , (Number_of_Docs - Number_of_Docs_UnD)]), 0, savelog);
+    writeAuditTrail(logfile, String.join(["   Number of documents undefined  ; " , Number_of_Docs_UnD]), 0, savelog);
+    writeAuditTrail(logfile, "   ------------------------------------------", 0, savelog);
+    writeAuditTrail(logfile, "   Individual classification results", 0, savelog);
+    var Class_Stats_Str = System.toJSON(Classification_Stats, true);
+    writeAuditTrail(logfile,     Class_Stats_Str, 0, savelog);
+    writeAuditTrail(logfile, "   ------------------------------------------", 0, savelog);

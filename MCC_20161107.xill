@@ -1,0 +1,537 @@
+// *****************************************************************************************
+// -----------------------------------------------------------------------------------------
+//  C L A S S I F Y - D O S S I E R - D O C U M E N T S  
+// -----------------------------------------------------------------------------------------
+// *****************************************************************************************
+// Version:     1.1
+// Date:        20160425 
+
+// Classify-HR-Docs performs the following actions
+// 	- load files from the input location and retrieve the base text content 
+//	- classify the documents against given keywords and through a classifier 
+//	it results is a suggested document classification type based on the model
+
+//	Based on the number of documents to classify the process can be time consuming
+
+//	PARAMETERS
+//		Input:		
+//		Input:		
+
+use Collection, File, Stream, String, System;
+use Date;
+//    include globals.variables.generic_variables;
+    include globals.routines.global_routines_generic;
+    include globals.routines.global_routines_mcc;
+    include globals.routines.global_classifier;
+
+// ****************************************************************************************************
+// ** V A R I A B L E - D E C L A R A T I O N - B L O C K 
+// ****************************************************************************************************
+
+// *******************************************************
+// SELECT WHICH CUSTOMER SPECIF CONFIGURATION MUST BE USED
+var cust_name                = "Fatima";
+// var cust_name                = "DeBetuwe";
+// var cust_name                = "Sonepar";
+// var cust_name                = "Karmac";
+// var cust_name                = "COA";
+// var cust_name                = "migrato";
+// var cust_name                = "achmea_dl";
+//********************************************************
+var rerun                       = false; // indicates if this run is intended as a rerun to classify UNDEFINED documents
+
+var cust_settings_bot           = "";
+if (rerun) 
+    { cust_settings_bot           = String.join(["Globals/Classifier/Classifier_Settings_", cust_name ,"_rerun.xill"]); }
+else
+    { cust_settings_bot           = String.join(["Globals/Classifier/Classifier_Settings_", cust_name ,".xill"]); }
+
+var settings                    = callbot("Globals/Settings/Global_Settings.xill", {"server":"localhost" , "dbsname":cust_name});
+var dlc                         = callbot(cust_settings_bot);
+var Bestand_Txt                 = "";
+var Bestand_Txt_Stripped        = "";
+var Bestanden                   = {};
+var Class_List                  = "";
+var Class_result                = {};
+var Class_Source                = "";
+var Classification_Stats        = {};
+var content_check               = {};
+var doc_id_found                = false;
+var doc_ids                     = {};           // used to create a list of the unique document identifiers for recognition
+var doc_list                    = {};
+var doc_is_mail                 = false;
+var DossierSeq                  = 0;
+var dossier_tab                 = "";
+var email_check                 = "";
+var final_classification_result = "";
+var folder_items                = {};
+var Folders                     = File.iterateFolders(settings.path_import, true);
+var header_lines                = {};
+var header_string               = "Source Filename;Target Filename;Dossier tab;Final result;Classified by;Classifier tag;Points;Relevance;Characters;Keyword;Probability\n";
+var invalidCharsHex             = "";
+var timestamp                   = Date.format(Date.now(), "yyyyMMdd_HHmm");
+var logfile                     = File.openWrite(String.join([settings.path_audittrail, timestamp, "_classification.log"]));
+var max_text_length             = 1200;
+var multi_header_lines          = {};
+var Number_of_Docs              = 0;
+var Number_of_Docs_UnD          = 0;
+var Number_of_Folders           = 0;
+var possible_docs               = {};
+var last_folder_name            = "";
+var results_file                = File.openWrite(settings.results_file);
+var savelog                     = settings.savelogfile;
+var set_final_result            = false;
+var stop_word_list              = [];
+var tags                        = {};
+var template_id_match           = false;
+var term_list                   = {};
+var terms                       = {};
+var terms_multi                 = {};
+
+// ======================================================================================================
+// ******************   M A I N - C O D E  **************************************************************
+// ======================================================================================================
+
+    writeAuditTrail (logfile, "Starting classification module", 0, savelog);
+    Stream.write    (header_string, results_file);
+    
+    // initializing the classificaton runtime statistics, will count each document classified
+    foreach(waarde, value in dlc.HR_dossier_tabs) {
+        foreach(_, doctype in value) {
+            Classification_Stats[String.join([waarde , "-" , doctype])] = 0;
+        }
+        Classification_Stats[String.join([waarde , "-undefined"])] = 0;
+    }
+    
+    // initialize the document counter for each document type in a dossie
+    // used to generate a sequence number in writing files after classsification
+    foreach(value, item in dlc.HR_external_name) {
+        doc_list[item] = 1;
+    }
+    
+    // loading all the document recognition terms from the configuration file
+    foreach (waarde, value in dlc.document_types) {
+        if (value.active) {
+            if (value.doc_id != null ) {
+                    doc_ids[waarde]     = value.doc_id;
+            }
+            if (Collection.length(value.header_line) > 0 ) {
+                    header_lines[waarde]    = value.header_line;
+            }
+            if (Collection.containsKey(value, "multi_header_line")) {
+                    multi_header_lines[waarde] = value.multi_header_line; 
+            }
+            if (Collection.length(value.keyterms) > 0) {
+                    terms[waarde]       = value.keyterms;
+            }
+            if (Collection.length(value.multi_terms.A) > 0 ) {
+                    terms_multi[waarde] = value.multi_terms;
+            }
+        }
+    }
+    
+    // creating the output folder if it doesn't exist already
+    File.createFolder(settings.path_files);
+    
+    // reading all sub folders and processing each file in the folder for classification
+    foreach(i, Folder in Folders) {
+        if (dlc.allfolders || String.contains(Folder, dlc.specific_folder)) {
+            // get all files from the sub folders in the given start folder
+            Bestanden       = File.iterateFiles(Folder.path, true);
+            // remove stop words
+            stop_word_list  = load_stop_words();
+            
+            // process each file in the subfolder
+            foreach(j, Bestand in Bestanden) {
+                if (rerun) {
+                    if (!String.contains(Bestand, "ONBEKEND")) {
+                        continue ;
+                    }
+                }
+                writeAuditTrail     (logfile, String.join(["Processing file " , Bestand]), 0, savelog);
+                // remember folder name of document processed, to reset document counters
+                folder_items        = String.split(Bestand, "\\\\", false);
+                last_folder_name    = folder_items[Collection.length(folder_items)-2];
+                // Check if dossiertab is incorporated in filename.
+                dossier_tab         = get_dossier_tab(folder_items[Collection.length(folder_items)-1], dlc);
+                possible_docs       = dlc.HR_dossier_tabs[dossier_tab];
+
+                content_check       = {};
+                term_list           = {};
+                set_final_result    = false;
+                doc_id_found        = false;
+                Class_result        = {};
+                var class_text_length     = max_text_length;
+                Class_Source        = "";
+                
+                // retrieve the raw document content from the file
+                if (String.contains(Bestand, ".txt")) {
+                    var fileID = File.openRead(Bestand);
+                    Bestand_Txt = Stream.getText(fileID);
+                } else {
+                    var file_type       = getcontenttype(Bestand);
+                    Bestand_Txt         = gettext(Bestand, file_type);
+                }
+                
+                if (String.length(Bestand_Txt) > 7500) {
+                    Bestand_Txt = String.substring(Bestand_Txt, 0,7499);
+                    System.print("text reduced");
+                }
+                
+                
+                if ( Bestand_Txt == "" || Bestand_Txt == null ) {
+                    writeAuditTrail(logfile, "   ERROR: empty text file", 3, savelog);
+                    continue;
+                } 
+                else
+                {   // delete end of string hyphens - treated as wordseparation symbol
+                    Bestand_Txt          = String.replace(Bestand_Txt, "-[\\x0A]", "\n");
+                    // remove except [a-z, A-Z, 0-9, space, /, -, ;]
+                    Bestand_Txt_Stripped = cleanup_text(Bestand_Txt); 
+                    // depending on the length of the document the length is set to determine
+                    // the classification, maximum is 3 iterations of text-blocks.
+                    if (String.length(Bestand_Txt_Stripped) > 2000 ) { class_text_length = 1300; }
+                    if (String.length(Bestand_Txt_Stripped) > 3000 ) { class_text_length = 1300; }
+                    if (String.length(Bestand_Txt_Stripped) > 4000 ) { class_text_length = 1900; }
+//                    System.print(String.length(Bestand_Txt_Stripped));
+                    if (String.length(Bestand_Txt_Stripped) < max_text_length ) 
+                            { class_text_length = String.length(Bestand_Txt_Stripped); }
+                    
+
+                    var strip_length;
+                    // remove stop words from file text, only descriptive content is to be processed.
+                    Bestand_Txt_Stripped = remove_stop_words(Bestand_Txt_Stripped, stop_word_list);
+                    if (String.length(Bestand_Txt_Stripped) + 1 > dlc.length_header_txt) {
+                        strip_length = dlc.length_header_txt;
+                    } else {
+                        strip_length = String.length(Bestand_Txt_Stripped); 
+                    }
+                    
+                    
+                    // ****** UNIQUE DOCUMENT IDENTIFIER CHECK
+                    // if this project is having document identifiers as option to recognize
+                    // its first tested against the document (header) text.
+                    if (dlc.use_doc_ids) {
+                        content_check   = check_doc_id(String.substring(String.toLower(Bestand_Txt_Stripped),0, strip_length), doc_ids, dlc, term_list);
+                        if (Collection.length(content_check) != 0) {
+                                doc_id_found = true;
+                                Class_Source = "DocumentID";
+                                writeAuditTrail(logfile, "   Document classified by unique identifier!", 9, savelog);
+                        }
+                    }
+
+                    // ****** CHECK FIRST LINES OF DOCUMENT FOR SPECIFIC MULTIPLE HEADER LINES
+                    if (Collection.length(content_check) != 0) { } else { content_check = {}; }
+                    if (Collection.length(multi_header_lines) > 0 && !doc_id_found) {
+                        var Bestand_Lines = String.split(Bestand_Txt, "\n", false);
+                        // check against header_lines
+                        foreach (x, multi_header in multi_header_lines) {
+                            var line_header = String.split(multi_header[0], "\n", false);
+                            foreach(y, value in line_header) {
+                                foreach(Key, Line in Bestand_Lines) {
+                                    Line = cleanup_txtline(Line);
+                                    if (String.length(Line) <= 5 || Key > 20) 
+                                        { continue; } // skip empty text lines
+                                    var header_check   = check_headers(String.toLower(Line), value, dlc, term_list, email_check);
+                                    if (Collection.length(header_check) > 0 ) {
+                                        if (Collection.length(content_check) > 0) {
+                                            if (content_check[x] != 3) {
+                                                    content_check[x] = 3;
+                                            }    
+                                        } 
+                                        else
+                                        {   if (y==0) {
+                                                content_check[x] = 3;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (Collection.length(content_check) > 0 && !doc_id_found) {
+                        writeAuditTrail(logfile, "  Document classified by multiple header line!", 9, savelog);
+                        doc_id_found = true;
+                        Class_Source = "Header line (m)";
+                    }
+
+                    // ****** CHECK FIRST LINES OF DOCUMENT FOR A SPECIFIC HEADER LINE                        
+                    if (Collection.length(header_lines) > 0 && !doc_id_found) {
+                        // check the document content per line on the presence of a specific header_line
+                        var Bestand_Lines = String.split(Bestand_Txt, "\n", false);
+                        // check against header_lines
+                        var process_line = 0;
+                        foreach(Key, Line in Bestand_Lines ) {
+                            // get rid of obsolete spaces 
+                            Line = cleanup_txtline(Line);
+
+                            if (Key > 0 && String.length(Line) <= 5 ) 
+                                { continue; } // skip empty text lines
+                                
+                            // the header line processed is recognized as a specific letter header Line
+                            // e.g. an address line, websitge address or e-mail address.
+                            if (check_letter_header_line(Line) == 1 || check_letter_header_line(Line) == 9) 
+                                {   // skip extra line for previous streetname Line
+                                    process_line = process_line - 1;
+                                    continue;
+                                }  
+                            if (check_letter_header_line(Line) != 0) 
+                                {   continue;
+                                }
+                            if (String.length(Line) > 95) {
+                                // The text line until CR/LF is probably more like a paragraph of text.
+                                // Skip this text line for processing
+                                process_line = process_line + 1;
+                                continue;
+                            } 
+                            else
+                            {
+                                // check line against specific header terms
+                                content_check   = check_headers(String.toLower(Line), header_lines, dlc, term_list, email_check);
+                                if (Collection.length(content_check) > 0 ) {
+                                        writeAuditTrail(logfile, "   Document classified by header line!", 9, savelog);
+                                        doc_id_found = true;
+                                        Class_Source = "Header line (s)";
+                                        break;
+                                }
+                                process_line = process_line + 1;
+                                if (process_line > 10) {  // don't process more then number of given lines of document processed!
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    
+                    if (Collection.length(content_check) == 0 ) {
+                    
+                        Bestand_Txt_Stripped    = String.replace(Bestand_Txt_Stripped, "[\\x0A\\x0D]", "");
+                        // Bestand_Txt_Stripped    = cleanup_txtline(Bestand_Txt_Stripped); // TEMPORARILY DISABLED
+                        
+                        // check if document is an e-mail type of document, certain document types can't be an e-mail
+                        // type of document!
+                        email_check = "";
+                        if (String.length(Bestand_Txt_Stripped) > 300 ) {
+                                email_check = check_for_correspondence(String.substring(String.toLower(Bestand_Txt), 0, 299));
+                        } else {
+                                email_check = check_for_correspondence(String.substring(String.toLower(Bestand_Txt),0, String.length(Bestand_Txt_Stripped)));
+                        }
+
+                        if (String.length(Bestand_Txt_Stripped) + 1 > dlc.length_header_txt) {
+                            var text_length = dlc.length_header_txt;
+                            var all_text    = false;
+
+                            while (true) {
+                                writeAuditTrail(logfile, String.substring(String.toLower(Bestand_Txt_Stripped),0,text_length), 8, savelog);
+
+                                content_check           = check_multi_keys(String.substring(String.toLower(Bestand_Txt_Stripped),0, text_length), terms_multi, dlc);
+                                
+                                if (Collection.length(content_check) == 0) {
+                                    content_check           = check_headers(String.substring(String.toLower(Bestand_Txt_Stripped), 0, text_length), terms, dlc, term_list, email_check);
+                                } else {
+                                    writeAuditTrail(logfile, "   Document classified using multi terms", 9,savelog);
+                                    Class_Source = "Multi terms";
+                                }
+                                if ( Collection.length(content_check) == 0 && all_text == false) {
+                                        text_length = text_length + 500;
+                                        if ( text_length > class_text_length )  // possible multiple text iterations
+                                                {   if (class_text_length < max_text_length) {
+                                                            text_length = String.length(Bestand_Txt_Stripped);
+                                                            all_text = true;
+                                                            continue;
+                                                    } 
+                                                    else 
+                                                    {        break; }
+                                                }
+                                        if ( text_length > String.length(Bestand_Txt_Stripped) && all_text == false) 
+                                                { text_length = String.length(Bestand_Txt_Stripped);
+                                                  all_text = true;}
+                                        else { continue; }
+                                }
+                                else
+                                {       Class_Source = "Keywords";
+                                        break;
+                                }
+                            }
+                        } 
+                        else
+                        {
+                            if ( String.length(Bestand_Txt_Stripped) > 2 ) {
+                                if (dlc.use_doc_ids) {
+                                        content_check       = check_doc_id(String.toLower(Bestand_Txt_Stripped), doc_ids, dlc, term_list);
+                                        Class_Source        = "DocumentID";
+                                }
+                                if (Collection.length(content_check) == 0) {
+                                        content_check           = check_multi_keys(String.toLower(Bestand_Txt_Stripped), terms_multi, dlc);
+                                        Class_Source            = "Multi keys";
+                                        if (Collection.length(content_check) == 0) {
+                                            content_check       = check_headers(String.toLower(Bestand_Txt_Stripped), terms, dlc, term_list, email_check);
+                                            Class_Source        = "Keywords";
+                                        }
+                                }
+                                writeAuditTrail(logfile, Bestand_Txt_Stripped, 8, savelog);
+                            }
+                        }
+                    }
+                    
+                    // classify the document against the model
+                    if ( dlc.use_classifier ) {
+                            tags                    = xda_Classify("http://127.0.0.1:15555", Bestand_Txt_Stripped, settings.ClModel);
+                            Class_result["tags"]    = process_tags(tags, dlc);
+                            Class_Source            = "Classifier";
+                    } 
+                    else
+                    {   // if classifier is not used - use a dummy value set
+                        tags    =   {   "documentsoort" : "undefined",
+                                        "score"         : 0,
+                                        "probability"   : 0
+                        };
+                        Class_result["tags"] = tags;
+                    }
+                }
+                
+                if (    Collection.length(term_list) == 1 && 
+                        Collection.contains(dlc.needs_classifier_list, term_list[0]) && 
+                        dlc.use_classifier == false) {
+                        
+                    // will run classifier as additional check.
+                    tags = xda_Classify("http://127.0.0.1:15555", Bestand_Txt_Stripped, settings.ClModel);
+                    Class_Source = "Classifier";
+                    
+                    if (tags != null) {
+                        Class_result["tags"]    = process_tags(tags, dlc);
+                        if (Class_result.tags.score < dlc.document_types[Class_result.tags.documentsoort].threshold) {
+                            content_check = {};  // reset values to UNDEFINED due to classifier score
+                        }
+                        
+                        // in case of one arbitrary key term found which is in the substitute list
+                        // the final classification will be changed to the collection header name
+                        foreach (values, new_doc_type in dlc.substitute_list) {
+                            if (Collection.contains(new_doc_type, term_list[0])) {
+                                content_check               = { values : 9 };
+                                final_classification_result = values;
+                                set_final_result            = true;
+                            }
+                        }
+                    }
+                }
+                
+                // determine the final result based on the classification and the keyword check
+                if ( !set_final_result ) {
+                        final_classification_result = process_results(Bestand, Class_result, content_check, 
+                                                              String.length(Bestand_Txt), dlc,
+                                                              possible_docs, content_check,
+                                                              dossier_tab);
+                }
+                
+                if (final_classification_result == "identiteitsbewijs" && 
+                        ( Collection.contains(term_list, "paspoort") || Collection.contains(term_list, "rijbewijs"))) {
+                    if ( String.length(Bestand_Txt) > 1000 ) {
+                        // An identification document doesn't contain a lot of text. If the document
+                        // does and is found only on paspoort or rijbewijs, it probably is an other type of document.
+                        final_classification_result = "undefined";
+                    }
+                }
+                
+                if (final_classification_result == "undefined" && email_check == "corr_email") {
+                        final_classification_result = "corr_email";
+                }
+ /*               
+                if (final_classification_result == "undefined" && String.length(Bestand_Txt) > 200 ) {
+                        if (String.length(Bestand_Txt_Stripped) > 300) {
+                            final_classification_result = check_for_correspondence(String.substring(String.toLower(Bestand_Txt),0, 300));
+                        } else {
+                            final_classification_result = check_for_correspondence(String.substring(String.toLower(Bestand_Txt),0, String.length(Bestand_Txt_Stripped)));
+                        }
+                } 
+*/                
+
+                // determine the dossier tab which corresponds to the document classification result
+                dossier_tab = "";
+                
+                foreach(docvalue in possible_docs) {
+                    if (String.contains(docvalue, final_classification_result)) {
+                        dossier_tab = last_folder_name;
+                        break;
+                    } else {
+                        dossier_tab = last_folder_name;
+                    }
+                }
+                
+                // determine the new external filename - can be customer specific
+                var result  = "";
+                if (!rerun) {
+                    result = rename_document(Bestand, final_classification_result, DossierSeq, dlc, settings, doc_list, String.length(Bestand_Txt));
+                }
+                else
+                {   
+                    result = rename_document(Bestand, final_classification_result, DossierSeq, dlc, settings, doc_list, String.length(Bestand_Txt));
+                }
+                
+                var filename_parts = String.split(result, "/");
+                var last_part = filename_parts[Collection.length(filename_parts)-1];
+                var last_parts = String.split(last_part, "_");
+                DossierSeq = last_parts[0];
+                
+                // DossierSeq = filename_parts[Collection.length(filename_parts)-2];
+                
+                // write the audittrail information
+                Class_List  = String.join([Bestand, result, dossier_tab, final_classification_result, Class_Source], ";");
+                Class_List  = String.join([Class_List, Class_result.tags.documentsoort, Class_result.tags.score, 
+                                            Class_result.tags.probability], ";");
+                Class_List  = String.join([Class_List, String.length(Bestand_Txt)], ";");
+                foreach(doc_type, resultaat in content_check) {
+                    Class_List = String.join([Class_List, doc_type, resultaat], ";");
+                }
+                Class_List = String.join([Class_List, "\n"]);
+                Stream.write(Class_List, results_file );
+                
+                if ( Classification_Stats[String.join([dossier_tab , "-" , final_classification_result])] == null || 
+                     Classification_Stats[String.join([dossier_tab , "-" , final_classification_result])] == "") 
+                    {
+                        if ( Classification_Stats[String.join(["AndereTab-" , final_classification_result])] == null || 
+                             Classification_Stats[String.join(["AndereTab-" , final_classification_result])] == "") {
+                                    Classification_Stats[String.join(["AndereTab-" , final_classification_result])] = 1;
+                        } 
+                        else
+                        {
+                                    Classification_Stats[String.join(["AndereTab-" , final_classification_result])] = 
+                                        Classification_Stats[String.join(["AndereTab-" , final_classification_result])] + 1; 
+                        }
+                    }
+                    else 
+                    {
+                            Classification_Stats[String.join([dossier_tab , "-" , final_classification_result])] =
+                               Classification_Stats[String.join([dossier_tab + "-" , final_classification_result])] + 1;
+                    }
+
+                // set as possible break point for controlling the classification result
+                if (final_classification_result == "undefined") {
+                    // set break point at this line - for tracing purposes only
+                }
+                
+                writeAuditTrail(logfile, String.join(["  ==> " , final_classification_result]), 9, savelog );
+                // writeAuditTrail(logfile, String.join(["Classificatie resultaten:" , Class_List]), 8, savelog);
+                Number_of_Docs = Number_of_Docs + 1;
+                if (final_classification_result == "undefined") 
+                        { Number_of_Docs_UnD = Number_of_Docs_UnD + 1; }
+
+            }
+        }
+    }
+
+    
+// ****************************************************************************************************
+// ** E N D - O F - P R O C E S S 
+// ****************************************************************************************************
+
+    writeAuditTrail(logfile, "End of classification process.", 0, savelog);
+    writeAuditTrail(logfile, "   ------------------------------------------", 0, savelog);
+    writeAuditTrail(logfile, String.join(["   Number of folders processed    ; " , Number_of_Folders]), 0, savelog);
+    writeAuditTrail(logfile, String.join(["   Number of documents processed  ; " , Number_of_Docs]), 0 , savelog);
+    writeAuditTrail(logfile, String.join(["   Number of documents classified ; " , (Number_of_Docs - Number_of_Docs_UnD)]), 0, savelog);
+    writeAuditTrail(logfile, String.join(["   Number of documents undefined  ; " , Number_of_Docs_UnD]), 0, savelog);
+    writeAuditTrail(logfile, "   ------------------------------------------", 0, savelog);
+    writeAuditTrail(logfile, "   Individual classification results", 0, savelog);
+    var Class_Stats_Str = System.toJSON(Classification_Stats, true);
+    writeAuditTrail(logfile,     Class_Stats_Str, 0, savelog);
+    writeAuditTrail(logfile, "   ------------------------------------------", 0, savelog);
